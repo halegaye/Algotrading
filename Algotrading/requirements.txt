@@ -1,0 +1,9 @@
+# Matriks IQ Trading Bot - Bağımlılıklar
+flask>=2.3.0
+sqlalchemy>=2.0.0
+apscheduler>=3.10.0
+pytz>=2023.3
+requests>=2.31.0
+
+# PostgreSQL desteği için (opsiyonel)
+# psycopg2-binary>=2.9.0
