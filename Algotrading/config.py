@@ -67,3 +67,21 @@ KEEPALIVE_INTERVAL = 30            # Saniye cinsinden keepalive gönderme aralı
 
 # Mesaj tipi (SetMessageType0 = JSON)
 MESSAGE_TYPE = "SetMessageType0"
+
+# ─────────────────────────────────────────────
+# ÇİFT SİNYAL FİLTRELEME AYARLARI
+# ─────────────────────────────────────────────
+# TradingView'den iki FARKLI alarm kaynağı gelir.
+# Her ikisinde de ortak olan hisseler (intersection) alım listesine alınır.
+#
+# TradingView'de iki ayrı alert oluştur, her biri farklı "source" değeri göndersin:
+#   Alert 1 mesajı: {"secret":"...", "source":"A", "symbols":["GARAN","THYAO",...]}
+#   Alert 2 mesajı: {"secret":"...", "source":"B", "symbols":["GARAN","ASELS",...]}
+#
+SIGNAL_SOURCE_A = "A"             # 1. alarm kaynağının "source" değeri
+SIGNAL_SOURCE_B = "B"             # 2. alarm kaynağının "source" değeri
+
+# Bekleme penceresi: İlk sinyal geldiğinde ikincisini bu kadar saniye bekle.
+# 300 sn = 5 dakika (17:30'da ilk gelirse 17:35'e kadar bekler).
+# Süre dolmadan ikinci gelmezse → o gün işlem yapılmaz.
+SIGNAL_WINDOW_SECONDS = 300

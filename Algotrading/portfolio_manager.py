@@ -278,30 +278,87 @@ class PortfolioManager:
     # SINYAL FİLTRELEME
     # ─────────────────────────────────────────
 
-    def filter_new_signals(self, incoming_symbols: List[str]) -> List[str]:
+    def filter_new_signals(self, intersection_symbols: List[str]) -> List[str]:
         """
-        Gelen sinyal listesinden:
-        1. Zaten portföyde olanları çıkarır.
-        2. Mevcut boşluk kadar sembol döndürür.
+        Çift sinyal kesişiminden gelen listeyi portföy durumuna göre filtreler.
+        Bu metot NewOrder (ApiCommands: 3) sürecine GİRMEDEN HEMEN ÖNCE çalışır.
+
+        Uygulanan kurallar (sırayla):
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ 1. Zaten portföyde olan hisseler listeden çıkarılır.             │
+        │ 2. Kesişim listesi boş slot sayısıyla kırpılır.                  │
+        │    Örnek: 2 boş slot, 3 kesişim → sadece ilk 2 alınır.          │
+        │ 3. Kesişimde sadece 1 hisse varsa, sadece o 1 alınır.            │
+        │    Diğer slot nakit olarak bırakılır (zorla doldurulmaz).        │
+        │ 4. Kesişim tamamen boşsa işlem yapılmaz.                         │
+        └──────────────────────────────────────────────────────────────────┘
+
+        Args:
+            intersection_symbols: SignalBuffer'ın hesapladığı kesişim listesi.
+                                  Sırası Kaynak A'nın orijinal sırasına göre korunur.
+
+        Returns:
+            Alım emri gönderilecek sembol listesi (boş olabilir).
         """
+        # ── 1. Boş slot kontrolü ─────────────────────────────────────────
         available_slots = self.get_available_slots()
+
         if available_slots == 0:
-            self.log.log("INFO", "SIGNAL_FILTER", "Portföy dolu, yeni pozisyon açılmayacak.")
+            self.log.log(
+                "INFO", "SIGNAL_FILTER",
+                "Portföy dolu (boş slot yok). Kesişim listesi işlenmeyecek.",
+                extra_data={"intersection": intersection_symbols}
+            )
             return []
 
-        selected = []
-        for symbol in incoming_symbols:
-            if len(selected) >= available_slots:
-                break
-            if not self.is_symbol_in_portfolio(symbol):
-                selected.append(symbol)
-            else:
-                self.log.log("INFO", "SIGNAL_SKIP",
-                             f"{symbol} zaten portföyde, atlanıyor.", symbol=symbol)
+        if not intersection_symbols:
+            self.log.log(
+                "INFO", "SIGNAL_FILTER",
+                "Kesişim listesi boş. O gün işlem yapılmayacak."
+            )
+            return []
 
-        self.log.log("INFO", "SIGNAL_FILTER",
-                     f"Gelen={len(incoming_symbols)} sembol, "
-                     f"Boşluk={available_slots}, Seçilen={selected}")
+        # ── 2. Portföyde zaten olanları çıkar ────────────────────────────
+        filtered = []
+        for symbol in intersection_symbols:
+            if self.is_symbol_in_portfolio(symbol):
+                self.log.log(
+                    "INFO", "SIGNAL_SKIP",
+                    f"{symbol} zaten portföyde, atlaniyor.",
+                    symbol=symbol
+                )
+            else:
+                filtered.append(symbol)
+
+        if not filtered:
+            self.log.log(
+                "INFO", "SIGNAL_FILTER",
+                "Kesisimdeki tüm hisseler zaten portföyde. Yeni pozisyon açılmayacak.",
+                extra_data={"intersection": intersection_symbols}
+            )
+            return []
+
+        # ── 3. Boş slot kadar kırp (örn: 2 slot, 3 hisse → ilk 2) ───────
+        # Kural: Kesişimde 1 hisse varsa sadece o alınır, slot zorla doldurulmaz.
+        # Kural: Kesişimde slot'tan fazla hisse varsa ilk N tanesi alınır.
+        selected = filtered[:available_slots]
+
+        self.log.log(
+            "INFO", "SIGNAL_FILTER",
+            f"Kesisim={intersection_symbols} | "
+            f"Portföyde_olmayan={filtered} | "
+            f"Bos_slot={available_slots} | "
+            f"Secilen={selected} "
+            f"({'slot dolduruldu' if len(filtered) >= available_slots else 'nakit bosluk birakiliyor'})",
+            extra_data={
+                "intersection":  intersection_symbols,
+                "after_portfolio_filter": filtered,
+                "available_slots": available_slots,
+                "selected":      selected,
+                "cash_gap":      available_slots - len(selected),
+            }
+        )
+
         return selected
 
     # ─────────────────────────────────────────
