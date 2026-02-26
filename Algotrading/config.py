@@ -26,7 +26,7 @@ WEBHOOK_SECRET = "your_webhook_secret_key"  # TradingView webhook güvenlik anah
 # ─────────────────────────────────────────────
 MAX_POSITIONS = 5          # Aynı anda taşınabilecek maksimum pozisyon sayısı
 TAKE_PROFIT_PCT = 6.0      # Kar al yüzdesi
-STOP_LOSS_PCT = 6.0        # Zarar durdur yüzdesi
+STOP_LOSS_PCT = 2.5       # Zarar durdur yüzdesi
 MAX_HOLD_DAYS = 2          # Maksimum elde tutma günü (işlem günü)
 
 # ─────────────────────────────────────────────
@@ -35,7 +35,7 @@ MAX_HOLD_DAYS = 2          # Maksimum elde tutma günü (işlem günü)
 SIGNAL_CHECK_TIME = "17:30"       # TradingView sinyali bekleme saati
 ORDER_SEND_TIME = "17:40"         # Alım emirlerinin gönderilme saati
 EOD_CLOSE_TIME = "17:55"          # Gün sonu zorla kapanış saati (17:55 güvenli)
-MORNING_REFRESH_TIME = "08:05"    # Sabah TP/SL yenileme saati
+MORNING_REFRESH_TIME = "10:05"    # Sabah TP/SL yenileme saati
 
 # ─────────────────────────────────────────────
 # VERİTABANI AYARLARI

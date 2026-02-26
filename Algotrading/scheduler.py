@@ -174,14 +174,24 @@ class TaskScheduler:
 
         # Mevcut nakit bilgisini çek
         available_cash = self._get_available_cash()
-        num_stocks = len(self._pending_signals)
 
         if available_cash <= 0:
             self.log.log("ERROR", "TASK_BUY_NO_CASH",
                          f"Yetersiz nakit: {available_cash:.2f} TL")
             return
 
-        budget_per_stock = self.pm.calculate_budget_per_stock(available_cash, num_stocks)
+        # O gün kaç hisse satıldığını bul → dilim hesabının temeli
+        today_sold_count = self._today_sold_count()
+
+        self.log.log(
+            "INFO", "TASK_BUY_SOLD_COUNT",
+            f"Bugun satilan hisse sayisi: {today_sold_count} "
+            f"({'fallback: MAX_POSITIONS kullanilacak' if today_sold_count == 0 else 'bu sayi bolunen olacak'})",
+            extra_data={"today_sold": today_sold_count,
+                        "pending":    self._pending_signals}
+        )
+
+        budget_per_stock = self.pm.calculate_budget_per_stock(available_cash, today_sold_count)
 
         bought_symbols = []
         for symbol in self._pending_signals:
@@ -367,6 +377,40 @@ class TaskScheduler:
     # ─────────────────────────────────────────
     # YARDIMCI METODLAR
     # ─────────────────────────────────────────
+
+    def _today_sold_count(self) -> int:
+        """
+        Bugün kapatılan (satılan) pozisyon sayısını veritabanından okur.
+
+        Bu sayı dilim hesabının böleni olur:
+          dilim = toplam_nakit / today_sold_count
+
+        Eğer bugün hiç satış yoksa (bot yeni başlatıldı, portföy boştu)
+        0 döner → calculate_budget_per_stock MAX_POSITIONS fallback'e geçer.
+        """
+        from database import Trade
+        from datetime import date
+        import sqlalchemy
+
+        session = self.pm.Session()
+        try:
+            today_start = datetime.combine(date.today(), datetime.min.time())
+            count = (
+                session.query(Trade)
+                .filter(
+                    Trade.is_closed == True,
+                    Trade.sell_date >= today_start,
+                )
+                .count()
+            )
+            return int(count)
+        except Exception as e:
+            self.log.log("WARNING", "SOLD_COUNT_ERROR",
+                         f"Bugun satilan hisse sayisi alinamadi: {e}. "
+                         f"Fallback: MAX_POSITIONS kullanilacak.")
+            return 0
+        finally:
+            session.close()
 
     def _get_available_cash(self) -> float:
         """

@@ -68,18 +68,48 @@ class PortfolioManager:
     def calculate_budget_per_stock(
         self,
         available_cash: float,
-        num_new_stocks: int
+        today_sold_count: int,
     ) -> float:
         """
-        Mevcut nakit, alınacak hisse sayısına eşit bölünür.
-        Örn: 10.000 TL nakit, 2 hisse -> her birine 5.000 TL
+        Dilim Mantığı
+        ─────────────────────────────────────────────────────────────────
+        Bütçe, o gün kaç hisse satıldıysa o sayıya göre hesaplanır.
+
+        Örnek — o gün 2 satış, bakiye 100.000 TL:
+          dilim = 100.000 / 2 = 50.000 TL/hisse
+
+        Fallback — hiç satış yoktu (bot yeni başlatıldı, portföy boş):
+          dilim = bakiye / MAX_POSITIONS
+          dilim = 100.000 / 5 = 20.000 TL/hisse
+
+        Kesişimde sold_count'tan az hisse çıksa kalan nakit
+        zorla harcanmaz — o dilimler nakitte kalır.
+        ─────────────────────────────────────────────────────────────────
         """
-        if num_new_stocks <= 0 or available_cash <= 0:
+        if available_cash <= 0:
             return 0.0
-        budget = available_cash / num_new_stocks
-        self.log.log("INFO", "BUDGET_CALC",
-                     f"Nakit={available_cash:.2f} TL / {num_new_stocks} hisse = "
-                     f"{budget:.2f} TL/hisse")
+
+        if today_sold_count > 0:
+            divisor = today_sold_count
+            basis   = "bugun_satilan_hisse"
+        else:
+            # Portföy boşsa veya ilk başlatmada: MAX_POSITIONS'a böl
+            divisor = config.MAX_POSITIONS
+            basis   = "MAX_POSITIONS_fallback"
+
+        budget = available_cash / divisor
+
+        self.log.log(
+            "INFO", "BUDGET_CALC",
+            f"Nakit={available_cash:,.2f} TL / {divisor} ({basis}) = "
+            f"{budget:,.2f} TL/hisse",
+            extra_data={
+                "available_cash":    available_cash,
+                "divisor":           divisor,
+                "basis":             basis,
+                "budget_per_stock":  budget,
+            }
+        )
         return budget
 
     def calculate_quantity(self, budget: float, price: float) -> float:
