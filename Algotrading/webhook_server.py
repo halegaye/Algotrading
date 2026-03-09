@@ -1,51 +1,45 @@
 """
-Webhook Sunucusu — TradingView sinyallerini dinler + Dashboard API'si.
+Webhook Sunucusu
 
-ÇİFT SİNYAL FİLTRELEME MANTIĞI
-─────────────────────────────────────────────────────────────────────────────
-TradingView'den iki FARKLI alarm kaynağı (Source A ve Source B) gelir.
-Her iki listede de ORTAK olan hisseler (intersection) alım listesine alınır.
+ENDPOINT'LER:
+  POST /webhook/signalA   → Kaynak A sinyali (TradingView İndikatör 1)
+  POST /webhook/signalB   → Kaynak B sinyali (TradingView İndikatör 2)
+  GET  /signal-status     → Anlık tampon durumu
+  GET  /health            → Bot sağlık kontrolü
+  GET  /api/trades        → Dashboard: kapalı işlemler + açık MTM
+  GET  /api/equity        → Dashboard: aylık PnL
+  GET  /portfolio         → Açık pozisyon özeti
+  GET  /                  → React dashboard (dist/index.html)
 
-Akış:
-  1. İlk sinyal gelir (A veya B) → zamanlayıcı başlar (config.SIGNAL_WINDOW_SECONDS)
-  2. Pencere içinde ikinci sinyal gelir → kesişim hesaplanır → queue'ya gönderilir
-  3. Pencere dolarsa ve ikinci sinyal gelmezse → o gün işlem yapılmaz
+SINYAL TOPLAMA PENCERESİ:
+  • Her gün 17:30'da scheduler tarafından açılır
+  • 17:35'e kadar A ve/veya B sinyalleri toplanır
+  • 17:35'te kapanır → signal_engine.decide_trade_list() çağrılır
+  • Sonuç signal_queue'ya atılır → 17:40'ta alım emirleri gönderilir
 
-TradingView Alert Message formatı:
-  Kaynak A: {"secret": "...", "source": "A", "symbols": ["GARAN", "THYAO", ...]}
-  Kaynak B: {"secret": "...", "source": "B", "symbols": ["GARAN", "ASELS", ...]}
-
-DASHBOARD API ENDPOINTLERİ
-─────────────────────────────────────────────────────────────────────────────
-  GET /api/trades   → Record<string, Trade[]>  (Dashboard MOCK_TRADES formatı)
-  GET /api/equity   → {month, pnlPct}[]        (Dashboard MOCK_EQUITY_SERIES formatı)
-  GET /             → React build dist/index.html (otomatik açılır)
-
-CORS
-─────────────────────────────────────────────────────────────────────────────
-  Flask-CORS bağımlılığı olmadan manuel after_request hook ile eklenir.
-  Geliştirme: * (tüm originler)
-  Production: config.CORS_ORIGIN ile kısıtlanabilir.
-─────────────────────────────────────────────────────────────────────────────
+ÜÇ DURUM:
+  Durum 1 — Hem A hem B geldi  → A ∩ B kesişimi filtreden geçirilir
+  Durum 2 — Sadece A veya B   → Gelen listenin tamamı filtreden geçirilir
+  Durum 3 — Hiç gelmedi       → Log uyarısı, o gün işlem yok
 """
 
 import json
 import os
 import threading
 from collections import defaultdict
-from datetime import datetime, date
+from datetime import datetime, date, time as dtime
 from flask import Flask, request, jsonify, send_from_directory
 
 import config
-from database import Signal, Trade
+from database import Signal, Trade, PortfolioPosition
+from signal_engine import parse_raw_signal, decide_trade_list
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORS — Flask-CORS olmadan manuel
+# CORS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _add_cors_headers(response):
-    """Tüm yanıtlara CORS başlıkları ekler."""
     origin = getattr(config, "CORS_ORIGIN", "*")
     response.headers["Access-Control-Allow-Origin"]  = origin
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
@@ -54,157 +48,218 @@ def _add_cors_headers(response):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL BUFFER — Çift kaynak bekleme penceresi
+# SİNYAL TAMPONU — 17:30–17:35 toplama penceresi
 # ─────────────────────────────────────────────────────────────────────────────
 
-class SignalBuffer:
+class SignalCollector:
     """
-    Aynı gün içinde gelen A ve B sinyallerini thread-safe biçimde saklar.
-    Bekleme penceresi dolduğunda ya da her iki sinyal de geldiğinde
-    kesişim hesaplanır ve callback tetiklenir.
+    17:30–17:35 arasında A ve/veya B sinyallerini toplar.
 
     Durum geçişleri:
-      IDLE → (ilk sinyal gelir) → WAITING → (ikinci gelir) → DONE
-                                           → (süre dolar)  → EXPIRED
+      IDLE → (17:30 / open_window()) → COLLECTING
+           → (17:35 / timer)         → DECIDED
+           → (gün değişti)           → IDLE (otomatik reset)
+
+    Pencere DIŞINDA gelen sinyaller reddedilir ve log'a yazılır.
     """
 
-    STATE_IDLE    = "idle"
-    STATE_WAITING = "waiting"
-    STATE_DONE    = "done"
-    STATE_EXPIRED = "expired"
+    STATE_IDLE       = "idle"
+    STATE_COLLECTING = "collecting"
+    STATE_DECIDED    = "decided"
 
-    def __init__(self, window_seconds: int, on_intersection_ready, log):
-        self.window_seconds        = window_seconds
-        self.on_intersection_ready = on_intersection_ready
-        self.log                   = log
+    WINDOW_START = dtime(17, 30, 0)
+    WINDOW_END   = dtime(17, 35, 0)
+
+    def __init__(self, on_decision_ready, db_logger):
+        self.on_decision_ready = on_decision_ready
+        self.log   = db_logger
 
         self._lock    = threading.Lock()
         self._state   = self.STATE_IDLE
         self._day     = None
-        self._signals = {}
+        self._data_a  = None   # parse edilmiş A listesi ya da None
+        self._data_b  = None   # parse edilmiş B listesi ya da None
         self._timer   = None
 
-    def receive(self, source: str, symbols: list) -> dict:
-        today = date.today()
+    # ── Dışa açık ────────────────────────────────────────────────────────
+
+    def open_window(self):
+        """Scheduler 17:30'da çağırır. Toplama modunu açar."""
+        import pytz
+        today = datetime.now(pytz.timezone("Europe/Istanbul")).date()
+
         with self._lock:
-            if self._day != today:
-                self._reset_unlocked()
-                self._day = today
-
-            if source in self._signals:
-                self.log.log("WARNING", "SIGNAL_DUPLICATE",
-                             f"Kaynak {source} bu gun zaten geldi, guncelleniyor.",
-                             extra_data={"old": self._signals[source], "new": symbols})
-
-            self._signals[source] = symbols
-            self.log.log("INFO", "SIGNAL_BUFFER",
-                         f"Kaynak {source} alindi: {symbols} | "
-                         f"Mevcut: {list(self._signals.keys())} | Durum: {self._state}")
-
-            if config.SIGNAL_SOURCE_A in self._signals and \
-               config.SIGNAL_SOURCE_B in self._signals:
-                self._cancel_timer_unlocked()
-                return self._compute_and_fire_unlocked()
-
+            self._maybe_reset(today)
             if self._state == self.STATE_IDLE:
-                self._state = self.STATE_WAITING
-                self._start_timer_unlocked()
-                return {
-                    "buffer_status": "waiting",
-                    "message": (f"Kaynak {source} alindi. "
-                                f"Diger kaynak icin {self.window_seconds} saniye bekleniyor."),
-                    "received_sources": list(self._signals.keys()),
-                }
+                self._state = self.STATE_COLLECTING
+                self._start_timer(today)
+                self.log.log(
+                    "INFO", "WINDOW_OPEN",
+                    "[17:30] Sinyal toplama penceresi AÇILDI. "
+                    "17:35'e kadar /webhook/signalA ve /webhook/signalB bekleniyor.",
+                )
+
+    def receive(self, source: str, parsed_items: list[dict]) -> dict:
+        """
+        A veya B sinyali geldiğinde çağrılır.
+        Pencere dışındaysa reddeder.
+        """
+        import pytz
+        tz    = pytz.timezone("Europe/Istanbul")
+        now   = datetime.now(tz)
+        today = now.date()
+        now_t = now.time().replace(second=0, microsecond=0)
+
+        with self._lock:
+            self._maybe_reset(today)
+
+            # Pencere henüz açılmadı
+            if now_t < self.WINDOW_START:
+                self.log.log("WARNING", "SIGNAL_EARLY",
+                             f"[{source}] Pencere açılmadan önce sinyal geldi ({now_t}). "
+                             f"Reddedildi. Pencere: 17:30.")
+                return {"status": "rejected", "reason": "window_not_open"}
+
+            # Pencere kapandı veya karar verildi
+            if now_t >= self.WINDOW_END or self._state == self.STATE_DECIDED:
+                self.log.log("WARNING", "SIGNAL_LATE",
+                             f"[{source}] Pencere kapandıktan sonra sinyal geldi ({now_t}). "
+                             f"Reddedildi.")
+                return {"status": "rejected", "reason": "window_closed"}
+
+            # Pencere açık değilse (scheduler çalışmadıysa) otomatik aç
+            if self._state == self.STATE_IDLE:
+                self._state = self.STATE_COLLECTING
+                self._start_timer(today)
+                self.log.log("INFO", "WINDOW_AUTO_OPEN",
+                             f"[{source}] İlk sinyal ile pencere otomatik açıldı.")
+
+            # Veriyi kaydet
+            if source == "A":
+                self._data_a = parsed_items
+                self.log.log(
+                    "INFO", "SIGNAL_A_RECEIVED",
+                    f"[A] {len(parsed_items)} hisse alındı: "
+                    f"{[i['symbol'] for i in parsed_items]} | "
+                    f"B durumu: {'BEKLENIYOR' if self._data_b is None else 'ALINDI'}",
+                    extra_data={"symbols": [i['symbol'] for i in parsed_items],
+                                "b_received": self._data_b is not None}
+                )
+            else:
+                self._data_b = parsed_items
+                self.log.log(
+                    "INFO", "SIGNAL_B_RECEIVED",
+                    f"[B] {len(parsed_items)} hisse alındı: "
+                    f"{[i['symbol'] for i in parsed_items]} | "
+                    f"A durumu: {'BEKLENIYOR' if self._data_a is None else 'ALINDI'}",
+                    extra_data={"symbols": [i['symbol'] for i in parsed_items],
+                                "a_received": self._data_a is not None}
+                )
+
+            # İkisi de geldi → hemen karar ver
+            if self._data_a is not None and self._data_b is not None:
+                self._cancel_timer()
+                return self._make_decision_unlocked()
 
             return {
-                "buffer_status": "waiting",
-                "message":       f"Kaynak {source} guncellendi, digeri bekleniyor.",
-                "received_sources": list(self._signals.keys()),
+                "status":    "collected",
+                "source":    source,
+                "collected": self._collected_sources(),
+                "waiting":   ["B"] if source == "A" else ["A"],
+                "message":   f"Kaynak {source} alındı. "
+                             f"{'B bekleniyor.' if source == 'A' else 'A bekleniyor.'} "
+                             f"17:35'e kadar süre var.",
             }
 
     def status(self) -> dict:
         with self._lock:
             return {
-                "state":            self._state,
-                "day":              str(self._day),
-                "received_sources": list(self._signals.keys()),
-                "symbols_A":        self._signals.get(config.SIGNAL_SOURCE_A, []),
-                "symbols_B":        self._signals.get(config.SIGNAL_SOURCE_B, []),
+                "state":           self._state,
+                "day":             str(self._day),
+                "window_start":    str(self.WINDOW_START),
+                "window_end":      str(self.WINDOW_END),
+                "source_a":        [i['symbol'] for i in self._data_a] if self._data_a else [],
+                "source_b":        [i['symbol'] for i in self._data_b] if self._data_b else [],
+                "a_received":      self._data_a is not None,
+                "b_received":      self._data_b is not None,
             }
 
-    def _start_timer_unlocked(self):
-        self._timer = threading.Timer(self.window_seconds, self._on_window_expired)
+    # ── İç metotlar ──────────────────────────────────────────────────────
+
+    def _collected_sources(self):
+        sources = []
+        if self._data_a is not None: sources.append("A")
+        if self._data_b is not None: sources.append("B")
+        return sources
+
+    def _start_timer(self, today):
+        import pytz
+        tz       = pytz.timezone("Europe/Istanbul")
+        now      = datetime.now(tz)
+        close_dt = tz.localize(datetime.combine(today, self.WINDOW_END))
+        delay    = max(1, (close_dt - now).total_seconds())
+
+        self._timer = threading.Timer(delay, self._on_window_close)
         self._timer.daemon = True
         self._timer.start()
-        self.log.log("INFO", "SIGNAL_WINDOW_START",
-                     f"Bekleme penceresi acildi: {self.window_seconds} saniye.")
+        self.log.log("INFO", "WINDOW_TIMER",
+                     f"Pencere kapanma sayacı başlatıldı: {delay:.0f} sn (17:35)")
 
-    def _cancel_timer_unlocked(self):
-        if self._timer is not None:
+    def _cancel_timer(self):
+        if self._timer:
             self._timer.cancel()
             self._timer = None
 
-    def _compute_and_fire_unlocked(self) -> dict:
-        list_a = set(self._signals.get(config.SIGNAL_SOURCE_A, []))
-        list_b = set(self._signals.get(config.SIGNAL_SOURCE_B, []))
-        original_a   = self._signals.get(config.SIGNAL_SOURCE_A, [])
-        intersection = [s for s in original_a if s in list_b]
-        self._state  = self.STATE_DONE
-
-        self.log.log("INFO", "SIGNAL_INTERSECTION",
-                     f"Kesisim: A={sorted(list_a)} ∩ B={sorted(list_b)} = {intersection}",
-                     extra_data={"source_a": sorted(list_a), "source_b": sorted(list_b),
-                                 "intersection": intersection})
-
-        if not intersection:
-            self.log.log("WARNING", "SIGNAL_NO_INTERSECTION",
-                         "Iki listede ortak hisse bulunamadi. O gun islem yapilmayacak.")
-            return {"buffer_status": "done", "intersection": [],
-                    "message": "Ortak hisse yok, islem yapilmayacak."}
-
-        threading.Thread(target=self.on_intersection_ready,
-                         args=(intersection,), daemon=True).start()
-
-        return {"buffer_status": "done", "intersection": intersection,
-                "message": f"{len(intersection)} ortak hisse: {intersection}"}
-
-    def _reset_unlocked(self):
-        self._cancel_timer_unlocked()
-        self._state   = self.STATE_IDLE
-        self._signals = {}
-        self._timer   = None
-
-    def _on_window_expired(self):
+    def _on_window_close(self):
+        """17:35 timer callback — lock dışında çalışır."""
         with self._lock:
-            if self._state != self.STATE_WAITING:
+            if self._state != self.STATE_COLLECTING:
                 return
-            missing = (config.SIGNAL_SOURCE_B
-                       if config.SIGNAL_SOURCE_A in self._signals
-                       else config.SIGNAL_SOURCE_A)
-            self._state = self.STATE_EXPIRED
-            self.log.log("WARNING", "SIGNAL_WINDOW_EXPIRED",
-                         f"Bekleme penceresi doldu ({self.window_seconds} sn). "
-                         f"Kaynak '{missing}' gelmedi. O gun islem yapilmayacak.",
-                         extra_data={"received": list(self._signals.keys()),
-                                     "missing": missing})
+            self._make_decision_unlocked()
+
+    def _make_decision_unlocked(self) -> dict:
+        """Karar ver ve callback'i ateşle. Lock altında çalışır."""
+        self._state = self.STATE_DECIDED
+
+        trade_list, decision_code = decide_trade_list(
+            source_a  = self._data_a,
+            source_b  = self._data_b,
+            db_logger = self.log,
+        )
+
+        if trade_list:
+            threading.Thread(
+                target=self.on_decision_ready,
+                args=(trade_list, decision_code),
+                daemon=True,
+            ).start()
+
+        return {
+            "status":        "decided",
+            "decision_code": decision_code,
+            "trade_list":    trade_list,
+            "a_received":    self._data_a is not None,
+            "b_received":    self._data_b is not None,
+        }
+
+    def _maybe_reset(self, today):
+        if self._day != today:
+            self._cancel_timer()
+            self._state  = self.STATE_IDLE
+            self._day    = today
+            self._data_a = None
+            self._data_b = None
+            self._timer  = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEBHOOK + DASHBOARD API SUNUCUSU
+# WEBHOOK SUNUCUSU
 # ─────────────────────────────────────────────────────────────────────────────
 
-# React build çıktısının yolu (dist/index.html)
-# Bot dizinine göre: C:\matriks_bot\dashboard\dist
 _DIST_DIR = os.path.join(os.path.dirname(__file__), "dashboard", "dist")
 
 
 class WebhookServer:
-    """
-    Flask tabanlı sunucu:
-      • TradingView webhook sinyallerini alır (çift kaynak + kesişim)
-      • Dashboard için /api/trades ve /api/equity endpoint'lerini sunar
-      • React build'i statik dosya olarak servis eder
-    """
 
     def __init__(self, signal_queue, Session, db_logger, host: str, port: int):
         self.signal_queue = signal_queue
@@ -212,302 +267,53 @@ class WebhookServer:
         self.log          = db_logger
         self.host         = host
         self.port         = port
-        self.app          = Flask(__name__,
-                                  static_folder=_DIST_DIR,
-                                  static_url_path="")
 
-        self.buffer = SignalBuffer(
-            window_seconds        = config.SIGNAL_WINDOW_SECONDS,
-            on_intersection_ready = self._push_intersection_to_queue,
-            log                   = db_logger,
+        # Mark-to-market fiyat cache: {sembol: son_fiyat}
+        self._live_prices: dict[str, float] = {}
+
+        self.app = Flask(__name__, static_folder=_DIST_DIR, static_url_path="")
+
+        self.collector = SignalCollector(
+            on_decision_ready = self._on_decision_ready,
+            db_logger         = db_logger,
         )
 
-        # CORS tüm yanıtlara
         self.app.after_request(_add_cors_headers)
 
-        # Preflight OPTIONS istekleri
-        @self.app.route("/<path:path>", methods=["OPTIONS"])
-        @self.app.route("/", methods=["OPTIONS"])
-        def _options_handler(*args, **kwargs):
+        @self.app.route("/<path:p>", methods=["OPTIONS"])
+        @self.app.route("/",         methods=["OPTIONS"])
+        def _options(*a, **kw):
             from flask import Response
             return Response(status=204)
 
         self._register_routes()
 
-    # ── Sinyal queue'ya at ────────────────────────────────────────────────
+    # ── Karar callback ────────────────────────────────────────────────────
 
-    def _push_intersection_to_queue(self, symbols: list):
+    def _on_decision_ready(self, trade_list: list[str], decision_code: str):
+        """SignalCollector karar verince çağrılır → queue'ya at."""
         self.signal_queue.put({
-            "received_at": datetime.utcnow().isoformat(),
-            "symbols":     symbols,
-            "source":      "intersection",
+            "received_at":   datetime.utcnow().isoformat(),
+            "symbols":       trade_list,
+            "decision_code": decision_code,
         })
-        self.log.log("INFO", "SIGNAL_QUEUED",
-                     f"Kesisim queue'ya eklendi: {symbols}",
-                     extra_data={"symbols": symbols})
+        self.log.log(
+            "INFO", "SIGNAL_QUEUED",
+            f"[{decision_code.upper()}] Alım listesi queue'ya eklendi: {trade_list}",
+            extra_data={"symbols": trade_list, "decision": decision_code},
+        )
 
-    # ── Flask route'ları ──────────────────────────────────────────────────
+    # ── Dış arayüz ───────────────────────────────────────────────────────
 
-    def _register_routes(self):
+    def open_collection_window(self):
+        """Scheduler 17:30'da çağırır."""
+        self.collector.open_window()
 
-        # ── Sağlık kontrolü ──────────────────────────────────────────────
-        @self.app.route("/health", methods=["GET"])
-        def health():
-            return jsonify({
-                "status":        "ok",
-                "timestamp":     datetime.utcnow().isoformat(),
-                "signal_buffer": self.buffer.status(),
-            }), 200
+    def update_live_price(self, symbol: str, price: float):
+        """Scheduler ListPositions callback'inden çağırır (mark-to-market)."""
+        self._live_prices[symbol] = price
 
-        # ── TradingView webhook ───────────────────────────────────────────
-        @self.app.route("/webhook", methods=["POST"])
-        def webhook():
-            return self._handle_webhook(request)
-
-        # ── Sinyal tamponu durumu ─────────────────────────────────────────
-        @self.app.route("/signal-status", methods=["GET"])
-        def signal_status():
-            return jsonify(self.buffer.status()), 200
-
-        # ─────────────────────────────────────────────────────────────────
-        # DASHBOARD API — /api/trades
-        # ─────────────────────────────────────────────────────────────────
-        @self.app.route("/api/trades", methods=["GET"])
-        def api_trades():
-            """
-            Kapalı işlemleri satış tarihine göre gruplar.
-
-            Query params:
-              month=YYYY-MM  → sadece o ayın işlemleri (opsiyonel)
-
-            Response (Dashboard MOCK_TRADES formatı):
-            {
-              "2026-01-05": [
-                {
-                  "symbol":    "THYAO",
-                  "buyAt":     "2026-01-04T10:12",
-                  "sellAt":    "2026-01-05T11:05",
-                  "buyPrice":  245.5,
-                  "sellPrice": 251.0,
-                  "pnlPct":    2.24,
-                  "exitReason": "take_profit"
-                },
-                ...
-              ],
-              "2026-01-06": [...]
-            }
-            """
-            month_filter = request.args.get("month")  # "2026-01"
-
-            session = self.Session()
-            try:
-                query = session.query(Trade).filter(Trade.is_closed == True)
-
-                if month_filter:
-                    try:
-                        y, m = month_filter.split("-")
-                        from sqlalchemy import extract
-                        query = query.filter(
-                            extract("year",  Trade.sell_date) == int(y),
-                            extract("month", Trade.sell_date) == int(m),
-                        )
-                    except Exception:
-                        return jsonify({"error": "month parametresi YYYY-MM formatında olmalı"}), 400
-
-                trades = query.order_by(Trade.sell_date).all()
-
-                # Satış gününe göre grupla
-                grouped: dict[str, list] = defaultdict(list)
-                for t in trades:
-                    key = t.sell_date_key()
-                    if key:
-                        grouped[key].append(t.to_dashboard_trade())
-
-                return jsonify(dict(grouped)), 200
-
-            except Exception as e:
-                self.log.log("ERROR", "API_TRADES_ERROR", f"/api/trades hatası: {e}")
-                return jsonify({"error": "Internal server error"}), 500
-            finally:
-                session.close()
-
-        # ─────────────────────────────────────────────────────────────────
-        # DASHBOARD API — /api/equity
-        # ─────────────────────────────────────────────────────────────────
-        @self.app.route("/api/equity", methods=["GET"])
-        def api_equity():
-            """
-            Aylık PnL toplamını ve kümülatif equity eğrisini döndürür.
-
-            Response (Dashboard MOCK_EQUITY_SERIES formatı):
-            [
-              {"month": "2025-08", "pnlPct": 6.2},
-              {"month": "2025-09", "pnlPct": -2.1},
-              ...
-            ]
-
-            Not: pnlPct, o aydaki tüm işlemlerin pnl_percent ortalamasıdır.
-            Gerçek portföy etkisi için ağırlıklı hesaplama ileride eklenebilir.
-            """
-            session = self.Session()
-            try:
-                from sqlalchemy import extract, func
-
-                rows = (
-                    session.query(
-                        extract("year",  Trade.sell_date).label("year"),
-                        extract("month", Trade.sell_date).label("month"),
-                        func.avg(Trade.pnl_percent).label("avg_pnl"),
-                        func.count(Trade.id).label("trade_count"),
-                    )
-                    .filter(Trade.is_closed == True, Trade.pnl_percent != None)
-                    .group_by("year", "month")
-                    .order_by("year", "month")
-                    .all()
-                )
-
-                result = []
-                for row in rows:
-                    y   = int(row.year)
-                    mo  = int(row.month)
-                    key = f"{y:04d}-{mo:02d}"
-                    result.append({
-                        "month":       key,
-                        "pnlPct":      round(float(row.avg_pnl), 4),
-                        "tradeCount":  int(row.trade_count),
-                    })
-
-                return jsonify(result), 200
-
-            except Exception as e:
-                self.log.log("ERROR", "API_EQUITY_ERROR", f"/api/equity hatası: {e}")
-                return jsonify({"error": "Internal server error"}), 500
-            finally:
-                session.close()
-
-        # ─────────────────────────────────────────────────────────────────
-        # MEVCUT PORTFÖY ENDPOINTİ (korundu)
-        # ─────────────────────────────────────────────────────────────────
-        @self.app.route("/portfolio", methods=["GET"])
-        def portfolio_status():
-            from database import PortfolioPosition
-            session = self.Session()
-            try:
-                positions     = session.query(PortfolioPosition).filter_by(is_active=True).all()
-                recent_trades = session.query(Trade).filter_by(is_closed=True)\
-                                       .order_by(Trade.sell_date.desc()).limit(10).all()
-                return jsonify({
-                    "active_positions": [
-                        {"symbol":     p.symbol,
-                         "entry_price": p.entry_price,
-                         "quantity":    p.quantity,
-                         "take_profit": p.take_profit_price,
-                         "stop_loss":   p.stop_loss_price,
-                         "days_held":   p.trading_days_held,
-                         "entry_date":  p.entry_date.isoformat() if p.entry_date else None}
-                        for p in positions
-                    ],
-                    "recent_trades": [t.to_dashboard_trade() for t in recent_trades],
-                    "signal_buffer": self.buffer.status(),
-                }), 200
-            finally:
-                session.close()
-
-        # ─────────────────────────────────────────────────────────────────
-        # REACT DASHBOARD — Statik dosya servisi
-        # ─────────────────────────────────────────────────────────────────
-        @self.app.route("/", methods=["GET"])
-        def serve_dashboard():
-            """React build dist/index.html'i döndürür."""
-            if os.path.isdir(_DIST_DIR) and os.path.isfile(
-                    os.path.join(_DIST_DIR, "index.html")):
-                return send_from_directory(_DIST_DIR, "index.html")
-            # dist henüz build edilmemişse bilgilendirici mesaj
-            return jsonify({
-                "status":  "dashboard_not_built",
-                "message": (
-                    "React dashboard henüz build edilmedi. "
-                    "C:\\matriks_bot\\dashboard dizininde "
-                    "'npm run build' komutunu çalıştır."
-                ),
-                "api_endpoints": ["/api/trades", "/api/equity", "/health"],
-            }), 200
-
-        @self.app.route("/<path:filename>", methods=["GET"])
-        def serve_static(filename):
-            """React build'in JS/CSS/asset dosyalarını servis eder."""
-            if os.path.isdir(_DIST_DIR):
-                file_path = os.path.join(_DIST_DIR, filename)
-                if os.path.isfile(file_path):
-                    return send_from_directory(_DIST_DIR, filename)
-            # SPA fallback: bilinmeyen yolları index.html'e yönlendir
-            if os.path.isdir(_DIST_DIR) and os.path.isfile(
-                    os.path.join(_DIST_DIR, "index.html")):
-                return send_from_directory(_DIST_DIR, "index.html")
-            return jsonify({"error": "Not found"}), 404
-
-    # ── Webhook işleme ────────────────────────────────────────────────────
-
-    def _handle_webhook(self, req):
-        try:
-            data = req.get_json(silent=True)
-            if not data:
-                return jsonify({"error": "Invalid JSON"}), 400
-
-            if data.get("secret", "") != config.WEBHOOK_SECRET:
-                self.log.log("WARNING", "WEBHOOK_AUTH_FAIL", "Gecersiz secret.",
-                             extra_data={"ip": req.remote_addr})
-                return jsonify({"error": "Unauthorized"}), 401
-
-            source = str(data.get("source", "")).strip().upper()
-            valid  = {config.SIGNAL_SOURCE_A.upper(), config.SIGNAL_SOURCE_B.upper()}
-            if source not in valid:
-                self.log.log("WARNING", "WEBHOOK_BAD_SOURCE",
-                             f"Gecersiz source: '{source}'. Beklenen: {valid}")
-                return jsonify({"error": "Invalid source", "expected": list(valid)}), 400
-
-            symbols = data.get("symbols", [])
-            if not isinstance(symbols, list) or not symbols:
-                return jsonify({"error": "symbols field required"}), 400
-            symbols = [s.strip().upper() for s in symbols
-                       if isinstance(s, str) and s.strip()]
-
-            self.log.log("INFO", "WEBHOOK_RECEIVED",
-                         f"Kaynak={source} | Semboller={symbols}",
-                         extra_data={"source": source, "symbols": symbols})
-
-            self._save_signal(data, symbols)
-            buffer_result = self.buffer.receive(source, symbols)
-
-            return jsonify({
-                "status":            "accepted",
-                "source":            source,
-                "symbols_received":  symbols,
-                "timestamp":         datetime.utcnow().isoformat(),
-                **buffer_result,
-            }), 200
-
-        except Exception as e:
-            self.log.log("ERROR", "WEBHOOK_ERROR", f"Webhook hatasi: {e}")
-            return jsonify({"error": "Internal server error"}), 500
-
-    def _save_signal(self, raw_data: dict, symbols: list):
-        session = self.Session()
-        try:
-            session.add(Signal(
-                received_at = datetime.utcnow(),
-                raw_payload = json.dumps(raw_data, ensure_ascii=False),
-                symbols     = ",".join(symbols),
-                processed   = False,
-            ))
-            session.commit()
-        except Exception as e:
-            session.rollback()
-            self.log.log("ERROR", "SIGNAL_SAVE_ERROR", f"Kayit hatasi: {e}")
-        finally:
-            session.close()
-
-    def mark_signal_processed(self, symbols_bought: list):
+    def mark_signal_processed(self, symbols_bought: list[str]):
         session = self.Session()
         try:
             signal = session.query(Signal).order_by(Signal.id.desc()).first()
@@ -520,7 +326,341 @@ class WebhookServer:
         finally:
             session.close()
 
+    # ── Flask route'ları ──────────────────────────────────────────────────
+
+    def _register_routes(self):
+
+        # ── Sağlık ───────────────────────────────────────────────────────
+        @self.app.route("/health", methods=["GET"])
+        def health():
+            return jsonify({
+                "status":    "ok",
+                "timestamp": datetime.utcnow().isoformat(),
+                "collector": self.collector.status(),
+            }), 200
+
+        # ── Sinyal durumu ─────────────────────────────────────────────────
+        @self.app.route("/signal-status", methods=["GET"])
+        def signal_status():
+            return jsonify(self.collector.status()), 200
+
+        # ── /webhook/signalA ─────────────────────────────────────────────
+        @self.app.route("/webhook/signalA", methods=["POST"])
+        def webhook_a():
+            return self._handle_signal(request, source="A")
+
+        # ── /webhook/signalB ─────────────────────────────────────────────
+        @self.app.route("/webhook/signalB", methods=["POST"])
+        def webhook_b():
+            return self._handle_signal(request, source="B")
+
+        # ── /api/trades ───────────────────────────────────────────────────
+        @self.app.route("/api/trades", methods=["GET"])
+        def api_trades():
+            """
+            Kapalı işlemler + açık pozisyonların mark-to-market değeri.
+
+            Query params:
+              month=YYYY-MM     sadece o ay (opsiyonel)
+              include_open=0    açık pozisyonları dahil etme
+
+            Response: {"2026-01-05": [{symbol,buyAt,sellAt,buyPrice,sellPrice,pnlPct,...}]}
+            Açık pozisyonlarda sellAt=null, isOpen=true
+            """
+            month_filter = request.args.get("month")
+            include_open = request.args.get("include_open", "1") != "0"
+
+            session = self.Session()
+            try:
+                from sqlalchemy import extract
+
+                q = session.query(Trade).filter(Trade.is_closed == True)
+                if month_filter:
+                    try:
+                        y, m = month_filter.split("-")
+                        q = q.filter(
+                            extract("year",  Trade.sell_date) == int(y),
+                            extract("month", Trade.sell_date) == int(m),
+                        )
+                    except Exception:
+                        return jsonify({"error": "month YYYY-MM formatında olmalı"}), 400
+
+                grouped: dict[str, list] = defaultdict(list)
+                for t in q.order_by(Trade.sell_date).all():
+                    key = t.sell_date_key()
+                    if key:
+                        grouped[key].append(t.to_dashboard_trade())
+
+                # Açık pozisyonlar — mark-to-market
+                if include_open:
+                    today_str = date.today().isoformat()
+                    positions = session.query(PortfolioPosition)\
+                                       .filter_by(is_active=True).all()
+
+                    if month_filter and positions:
+                        y_f, m_f = month_filter.split("-")
+                        if not (str(date.today().year) == y_f and
+                                f"{date.today().month:02d}" == m_f):
+                            positions = []  # Bu ay değil
+
+                    for pos in positions:
+                        live_px = self._live_prices.get(pos.symbol, pos.entry_price)
+                        pnl_pct = round(
+                            ((live_px - pos.entry_price) / pos.entry_price) * 100, 4
+                        ) if pos.entry_price else 0.0
+
+                        grouped[today_str].append({
+                            "symbol":     pos.symbol,
+                            "buyAt":      pos.entry_date.strftime("%Y-%m-%dT%H:%M")
+                                          if pos.entry_date else None,
+                            "sellAt":     None,
+                            "buyPrice":   pos.entry_price,
+                            "sellPrice":  live_px,
+                            "pnlPct":     pnl_pct,
+                            "exitReason": None,
+                            "isOpen":     True,
+                            "daysHeld":   pos.trading_days_held,
+                        })
+
+                return jsonify(dict(grouped)), 200
+
+            except Exception as e:
+                self.log.log("ERROR", "API_TRADES_ERR", f"/api/trades: {e}")
+                return jsonify({"error": "Internal server error"}), 500
+            finally:
+                session.close()
+
+        # ── /api/equity ───────────────────────────────────────────────────
+        @self.app.route("/api/equity", methods=["GET"])
+        def api_equity():
+            """
+            Aylık PnL — PnL Formülü:
+              Günlük Kar/Zarar = (Kapanan PnL Toplamı + Açık MTM PnL Toplamı) / MAX_POSITIONS
+
+            Response: [{"month":"2026-01","pnlPct":8.4,"tradeCount":12,"openCount":2}]
+            """
+            session = self.Session()
+            try:
+                from sqlalchemy import extract, func
+
+                # Kapalı işlemler aylık özet
+                rows = (
+                    session.query(
+                        extract("year",  Trade.sell_date).label("yr"),
+                        extract("month", Trade.sell_date).label("mo"),
+                        func.sum(Trade.pnl_percent).label("sum_pnl"),
+                        func.count(Trade.id).label("cnt"),
+                    )
+                    .filter(Trade.is_closed == True, Trade.pnl_percent != None)
+                    .group_by("yr", "mo")
+                    .order_by("yr", "mo")
+                    .all()
+                )
+
+                result = []
+                for row in rows:
+                    # Formül: toplam_pnl / MAX_POSITIONS
+                    avg = round(float(row.sum_pnl) / config.MAX_POSITIONS, 4)
+                    result.append({
+                        "month":      f"{int(row.yr):04d}-{int(row.mo):02d}",
+                        "pnlPct":     avg,
+                        "tradeCount": int(row.cnt),
+                        "openCount":  0,
+                    })
+
+                # Mevcut ay: açık pozisyonlar MTM dahil
+                positions = session.query(PortfolioPosition)\
+                                   .filter_by(is_active=True).all()
+                if positions:
+                    open_pnl_sum = sum(
+                        ((self._live_prices.get(p.symbol, p.entry_price) - p.entry_price)
+                         / p.entry_price) * 100
+                        for p in positions if p.entry_price
+                    )
+                    # Bu ayın kapalı PnL toplamı
+                    this_month = date.today().strftime("%Y-%m")
+                    this_y, this_m = date.today().year, date.today().month
+                    closed_sum = (
+                        session.query(func.sum(Trade.pnl_percent))
+                        .filter(
+                            Trade.is_closed == True,
+                            Trade.pnl_percent != None,
+                            extract("year",  Trade.sell_date) == this_y,
+                            extract("month", Trade.sell_date) == this_m,
+                        )
+                        .scalar()
+                    ) or 0.0
+
+                    # Formül: (kapanan_toplam + açık_mtm_toplam) / MAX_POSITIONS
+                    combined_avg = round(
+                        (closed_sum + open_pnl_sum) / config.MAX_POSITIONS, 4
+                    )
+
+                    existing = next((r for r in result if r["month"] == this_month), None)
+                    if existing:
+                        existing["pnlPct"]    = combined_avg
+                        existing["openCount"] = len(positions)
+                    else:
+                        result.append({
+                            "month":      this_month,
+                            "pnlPct":     combined_avg,
+                            "tradeCount": 0,
+                            "openCount":  len(positions),
+                        })
+
+                return jsonify(result), 200
+
+            except Exception as e:
+                self.log.log("ERROR", "API_EQUITY_ERR", f"/api/equity: {e}")
+                return jsonify({"error": "Internal server error"}), 500
+            finally:
+                session.close()
+
+        # ── /portfolio ────────────────────────────────────────────────────
+        @self.app.route("/portfolio", methods=["GET"])
+        def portfolio():
+            session = self.Session()
+            try:
+                positions = session.query(PortfolioPosition)\
+                                   .filter_by(is_active=True).all()
+                trades    = session.query(Trade).filter_by(is_closed=True)\
+                                   .order_by(Trade.sell_date.desc()).limit(10).all()
+                return jsonify({
+                    "active_positions": [
+                        {
+                            "symbol":           p.symbol,
+                            "entry_price":      p.entry_price,
+                            "live_price":       self._live_prices.get(p.symbol, p.entry_price),
+                            "quantity":         p.quantity,
+                            "take_profit":      p.take_profit_price,
+                            "stop_loss":        p.stop_loss_price,
+                            "days_held":        p.trading_days_held,
+                            "entry_date":       p.entry_date.isoformat() if p.entry_date else None,
+                            "unrealized_pct":   round(
+                                ((self._live_prices.get(p.symbol, p.entry_price)
+                                  - p.entry_price) / p.entry_price) * 100, 2
+                            ) if p.entry_price else 0.0,
+                        }
+                        for p in positions
+                    ],
+                    "recent_trades":  [t.to_dashboard_trade() for t in trades],
+                    "collector":      self.collector.status(),
+                    "live_prices":    self._live_prices,
+                }), 200
+            finally:
+                session.close()
+
+        # ── React statik ──────────────────────────────────────────────────
+        @self.app.route("/", methods=["GET"])
+        def serve_root():
+            if os.path.isfile(os.path.join(_DIST_DIR, "index.html")):
+                return send_from_directory(_DIST_DIR, "index.html")
+            return jsonify({
+                "status":   "dashboard_not_built",
+                "message":  "C:\\matriks_bot\\dashboard\\dist\\index.html bulunamadı.",
+                "hint":     "Yerel makinende 'npm run build' al, dist/ klasörünü sunucuya kopyala.",
+                "endpoints": ["/webhook/signalA", "/webhook/signalB",
+                              "/api/trades", "/api/equity", "/signal-status", "/health"],
+            }), 200
+
+        @self.app.route("/<path:fname>", methods=["GET"])
+        def serve_static(fname):
+            fp = os.path.join(_DIST_DIR, fname)
+            if os.path.isfile(fp):
+                return send_from_directory(_DIST_DIR, fname)
+            idx = os.path.join(_DIST_DIR, "index.html")
+            if os.path.isfile(idx):
+                return send_from_directory(_DIST_DIR, "index.html")
+            return jsonify({"error": "Not found"}), 404
+
+    # ── Webhook işleme ────────────────────────────────────────────────────
+
+    def _handle_signal(self, req, source: str):
+        try:
+            data = req.get_json(silent=True)
+            if not data:
+                return jsonify({"error": "Invalid JSON"}), 400
+
+            # Auth
+            if data.get("secret", "") != config.WEBHOOK_SECRET:
+                self.log.log("WARNING", "WEBHOOK_AUTH",
+                             f"[{source}] Geçersiz secret. IP: {req.remote_addr}")
+                return jsonify({"error": "Unauthorized"}), 401
+
+            # Sembol çözümleme
+            parsed_items = []
+            parse_mode   = "unknown"
+
+            raw_str = data.get("raw", "")
+            if raw_str:
+                # Ham format: "GARAN|RSI:74.2|ROC:1.8|Chg%:9.95 ..."
+                parsed_items = parse_raw_signal(raw_str)
+                parse_mode   = "raw"
+                self.log.log(
+                    "INFO", f"WEBHOOK_{source}_PARSED",
+                    f"[{source}] Ham parse: {len(parsed_items)} hisse → "
+                    f"{[i['symbol'] for i in parsed_items]}",
+                    extra_data={"mode": "raw", "items": parsed_items},
+                )
+            else:
+                # Direkt sembol listesi: ["GARAN","THYAO",...]
+                raw_list = data.get("symbols", [])
+                if not isinstance(raw_list, list) or not raw_list:
+                    return jsonify({"error": "symbols veya raw alanı gerekli"}), 400
+                parsed_items = [
+                    {"symbol": s.strip().upper(), "rsi": None, "roc": None, "chg": None}
+                    for s in raw_list if isinstance(s, str) and s.strip()
+                ]
+                parse_mode = "list"
+                self.log.log(
+                    "INFO", f"WEBHOOK_{source}_LIST",
+                    f"[{source}] Liste modu: {[i['symbol'] for i in parsed_items]}",
+                    extra_data={"mode": "list", "symbols": [i['symbol'] for i in parsed_items]},
+                )
+
+            if not parsed_items:
+                self.log.log("WARNING", f"WEBHOOK_{source}_EMPTY",
+                             f"[{source}] Parse sonrası sembol listesi boş.")
+                return jsonify({"status": "accepted_empty",
+                                "message": "Sembol listesi boş"}), 200
+
+            # Sinyal tampona gönder
+            self._save_signal(data, [i['symbol'] for i in parsed_items], source)
+            result = self.collector.receive(source, parsed_items)
+
+            return jsonify({
+                "status":      "accepted",
+                "source":      source,
+                "parse_mode":  parse_mode,
+                "symbols":     [i['symbol'] for i in parsed_items],
+                "timestamp":   datetime.utcnow().isoformat(),
+                **result,
+            }), 200
+
+        except Exception as e:
+            self.log.log("ERROR", f"WEBHOOK_{source}_ERR", f"Hata: {e}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def _save_signal(self, raw_data: dict, symbols: list[str], source: str):
+        session = self.Session()
+        try:
+            session.add(Signal(
+                received_at = datetime.utcnow(),
+                raw_payload = json.dumps({**raw_data, "_source": source},
+                                         ensure_ascii=False),
+                symbols     = ",".join(symbols),
+                processed   = False,
+                notes       = f"source={source}",
+            ))
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            self.log.log("ERROR", "SIGNAL_SAVE", f"Kayıt hatası: {e}")
+        finally:
+            session.close()
+
     def run(self):
         self.log.log("INFO", "WEBHOOK_START",
-                     f"Webhook sunucusu baslatildi: {self.host}:{self.port}")
+                     f"Webhook sunucusu başlatıldı: {self.host}:{self.port} | "
+                     f"Endpoint'ler: /webhook/signalA  /webhook/signalB")
         self.app.run(host=self.host, port=self.port, debug=False, use_reloader=False)

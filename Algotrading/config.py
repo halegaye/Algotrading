@@ -26,7 +26,7 @@ WEBHOOK_SECRET = "your_webhook_secret_key"  # TradingView webhook güvenlik anah
 # ─────────────────────────────────────────────
 MAX_POSITIONS = 5          # Aynı anda taşınabilecek maksimum pozisyon sayısı
 TAKE_PROFIT_PCT = 6.0      # Kar al yüzdesi
-STOP_LOSS_PCT = 2.5       # Zarar durdur yüzdesi
+STOP_LOSS_PCT = 6.0        # Zarar durdur yüzdesi
 MAX_HOLD_DAYS = 2          # Maksimum elde tutma günü (işlem günü)
 
 # ─────────────────────────────────────────────
@@ -35,7 +35,7 @@ MAX_HOLD_DAYS = 2          # Maksimum elde tutma günü (işlem günü)
 SIGNAL_CHECK_TIME = "17:30"       # TradingView sinyali bekleme saati
 ORDER_SEND_TIME = "17:40"         # Alım emirlerinin gönderilme saati
 EOD_CLOSE_TIME = "17:55"          # Gün sonu zorla kapanış saati (17:55 güvenli)
-MORNING_REFRESH_TIME = "10:05"    # Sabah TP/SL yenileme saati
+MORNING_REFRESH_TIME = "08:05"    # Sabah TP/SL yenileme saati
 
 # ─────────────────────────────────────────────
 # VERİTABANI AYARLARI
@@ -74,14 +74,33 @@ MESSAGE_TYPE = "SetMessageType0"
 # TradingView'den iki FARKLI alarm kaynağı gelir.
 # Her ikisinde de ortak olan hisseler (intersection) alım listesine alınır.
 #
-# TradingView'de iki ayrı alert oluştur, her biri farklı "source" değeri göndersin:
-#   Alert 1 mesajı: {"secret":"...", "source":"A", "symbols":["GARAN","THYAO",...]}
-#   Alert 2 mesajı: {"secret":"...", "source":"B", "symbols":["GARAN","ASELS",...]}
+# TradingView'de iki ayrı alert oluştur:
+#   İndikatör 1 Webhook URL: http://SUNUCU_IP:5000/webhook/signalA
+#   İndikatör 2 Webhook URL: http://SUNUCU_IP:5000/webhook/signalB
+#   Message: {"secret":"...","raw":"GARAN|RSI:74.2|ROC:1.8|Chg%:9.95 THYAO|..."}
+#   veya liste modu: {"secret":"...","symbols":["GARAN","THYAO",...]}
 #
-SIGNAL_SOURCE_A = "A"             # 1. alarm kaynağının "source" değeri
-SIGNAL_SOURCE_B = "B"             # 2. alarm kaynağının "source" değeri
+SIGNAL_SOURCE_A = "A"             # Dahili kaynak tanımlayıcısı (değiştirme)
+SIGNAL_SOURCE_B = "B"             # Dahili kaynak tanımlayıcısı (değiştirme)
 
 # Bekleme penceresi: İlk sinyal geldiğinde ikincisini bu kadar saniye bekle.
 # 300 sn = 5 dakika (17:30'da ilk gelirse 17:35'e kadar bekler).
 # Süre dolmadan ikinci gelmezse → o gün işlem yapılmaz.
 SIGNAL_WINDOW_SECONDS = 300
+
+# ─────────────────────────────────────────────
+# RSI / ROC / CHG% FİLTRE AYARLARI
+# ─────────────────────────────────────────────
+# Webhook'tan gelen ham string "{HISSE|RSI:val|ROC:val|Chg%:val}" formatı
+# parse edildikten sonra bu filtreler sırayla uygulanır.
+#
+# Kural 1 — RSI filtresi: [RSI_MIN, RSI_MAX] aralığı dışındakiler elenir
+RSI_MIN = 72.0
+RSI_MAX = 83.0
+
+# Kural 2 — Chg% tavan filtresi: bu aralıktakiler "tavan grubu" olarak önceliklendirilir
+CHG_MIN = 9.90
+CHG_MAX = 10.00
+
+# Kural 3 — ROC sıralaması: büyükten küçüğe, ilk MAX_POSITIONS alınır
+# (MAX_POSITIONS zaten yukarıda tanımlı: 5)

@@ -1,467 +1,380 @@
 """
 Görev Zamanlayıcı
-APScheduler ile periyodik ve saatlik görevleri yönetir.
+
+Günlük iş akışı:
+  10:05  Sabah TP/SL yenileme (emirler bir önceki günden iptal edilmiş olur)
+  17:30  Sinyal toplama penceresi AÇILIR
+  17:35  Pencere KAPANIR (webhook_server içinden otomatik)
+         → decide_trade_list() → Durum 1/2/3 kararı → queue'ya at
+  17:40  Queue okunur → ListPositions (ApiCommands:1) → MTM fiyatlar
+         → Alım emirleri (ApiCommands:3) gönderilir
+  17:55  Gün sonu: 2-gün sınırını aşan pozisyonlar kapatılır
+  18:05  İşlem günü sayacı artırılır
 """
 
-import threading
+import time
 import queue
-from datetime import datetime, time as dtime
-from typing import Optional, Dict, List
+from datetime import datetime, date
+from typing import Dict, List
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 
 import config
-from database import ExitReason
+from database import Trade
 
 
 class TaskScheduler:
-    """
-    Trading bot görevlerini zamanlar:
-    - 08:05: Sabah TP/SL yenileme
-    - 17:30: TradingView sinyal bekleme penceresi
-    - 17:40: Yeni alım emirlerini gönder
-    - 17:55: Gün sonu 2-gün sınırı kapanışları
-    """
 
     TIMEZONE = pytz.timezone("Europe/Istanbul")
 
-    def __init__(
-        self,
-        portfolio_manager,
-        matriks_client,
-        signal_queue: queue.Queue,
-        db_logger,
-        webhook_server
-    ):
-        self.pm = portfolio_manager
-        self.client = matriks_client
-        self.signal_queue = signal_queue
-        self.log = db_logger
+    def __init__(self, portfolio_manager, matriks_client,
+                 signal_queue: queue.Queue, db_logger, webhook_server):
+        self.pm             = portfolio_manager
+        self.client         = matriks_client
+        self.signal_queue   = signal_queue
+        self.log            = db_logger
         self.webhook_server = webhook_server
 
-        self._scheduler = BackgroundScheduler(timezone=self.TIMEZONE)
-        self._pending_signals: List[str] = []       # 17:30'da alınan semboller
-        self._open_orders_cache: List[dict] = []    # Bekleyen emirler cache'i
-        self._current_prices: Dict[str, float] = {} # Güncel fiyatlar
+        self._scheduler:         BackgroundScheduler = BackgroundScheduler(timezone=self.TIMEZONE)
+        self._open_orders_cache: List[dict]          = []
+        self._current_prices:    Dict[str, float]    = {}
+        self._cached_cash:       float               = 0.0
 
-        # MatriksIQ callback kayıtları
         self._setup_api_callbacks()
 
     # ─────────────────────────────────────────
-    # ZAMANLAYICI KURULUMU
+    # BAŞLAT / DURDUR
     # ─────────────────────────────────────────
 
     def start(self):
-        """Tüm zamanlanmış görevleri başlatır."""
-
-        # 08:05 - Sabah TP/SL yenileme
-        self._scheduler.add_job(
-            func=self._task_morning_refresh,
-            trigger=CronTrigger(hour=8, minute=5, timezone=self.TIMEZONE),
-            id="morning_refresh",
-            name="Sabah TP/SL Yenileme",
-            replace_existing=True
-        )
-
-        # 17:30 - Sinyal işleme penceresi (queue'yu oku)
-        self._scheduler.add_job(
-            func=self._task_process_signals,
-            trigger=CronTrigger(hour=17, minute=30, timezone=self.TIMEZONE),
-            id="signal_process",
-            name="Sinyal İşleme",
-            replace_existing=True
-        )
-
-        # 17:40 - Alım emirlerini gönder
-        self._scheduler.add_job(
-            func=self._task_send_buy_orders,
-            trigger=CronTrigger(hour=17, minute=40, timezone=self.TIMEZONE),
-            id="send_buy_orders",
-            name="Alım Emirleri",
-            replace_existing=True
-        )
-
-        # 17:55 - Gün sonu kapanışları (2-gün sınırı)
-        self._scheduler.add_job(
-            func=self._task_end_of_day_close,
-            trigger=CronTrigger(hour=17, minute=55, timezone=self.TIMEZONE),
-            id="eod_close",
-            name="Gün Sonu Kapanış",
-            replace_existing=True
-        )
-
-        # Her gün 18:05'te işlem günü sayacını artır
-        self._scheduler.add_job(
-            func=self._task_increment_trading_days,
-            trigger=CronTrigger(hour=18, minute=5, timezone=self.TIMEZONE),
-            id="increment_days",
-            name="İşlem Günü Sayacı",
-            replace_existing=True
-        )
-
+        jobs = [
+            ("morning_refresh",  10, 5,  self._task_morning_refresh,  "Sabah TP/SL"),
+            ("open_window",      17, 30, self._task_open_signal_window,"Pencere Aç"),
+            ("send_buy_orders",  17, 40, self._task_send_buy_orders,   "Alım Emirleri"),
+            ("eod_close",        17, 55, self._task_end_of_day_close,  "Gün Sonu"),
+            ("increment_days",   18, 5,  self._task_increment_trading_days, "Gün Sayacı"),
+        ]
+        for jid, hr, mn, fn, name in jobs:
+            self._scheduler.add_job(
+                func=fn,
+                trigger=CronTrigger(hour=hr, minute=mn, timezone=self.TIMEZONE),
+                id=jid, name=name, replace_existing=True,
+            )
         self._scheduler.start()
-        self.log.log("INFO", "SCHEDULER_START", "Görev zamanlayıcı başlatıldı.")
+        self.log.log("INFO", "SCHEDULER_START",
+                     "Zamanlayıcı başlatıldı → "
+                     "10:05 TP/SL | 17:30 Pencere | 17:40 Emirler | 17:55 EOD | 18:05 Gün++")
 
     def stop(self):
-        """Zamanlayıcıyı durdurur."""
         self._scheduler.shutdown(wait=False)
-        self.log.log("INFO", "SCHEDULER_STOP", "Görev zamanlayıcı durduruldu.")
+        self.log.log("INFO", "SCHEDULER_STOP", "Zamanlayıcı durduruldu.")
 
     # ─────────────────────────────────────────
-    # GÖREV TANIMLARI
+    # 10:05 — Sabah TP/SL yenileme
     # ─────────────────────────────────────────
 
     def _task_morning_refresh(self):
-        """
-        08:05 görevi: Tüm açık pozisyonların TP/SL emirlerini yeniler.
-        Borsada günlük emirler silindiği için sabah tekrar gönderilmesi gerekir.
-        """
-        self.log.log("INFO", "TASK_MORNING_REFRESH", "Sabah TP/SL yenileme başlıyor.")
+        self.log.log("INFO", "TASK_MORNING", "Sabah TP/SL yenileme başlıyor.")
         try:
-            # Bekleyen emirleri çek
             self.client.request_waiting_orders()
-            # Callback'te gelen emirler _open_orders_cache'e yazılacak
-            import time; time.sleep(2)  # API yanıtını bekle
-
+            time.sleep(2)
             self.pm.refresh_all_tp_sl_orders(self._open_orders_cache)
-            self.log.log("INFO", "TASK_MORNING_REFRESH", "Sabah TP/SL yenileme tamamlandı.")
+            self.log.log("INFO", "TASK_MORNING", "Sabah TP/SL yenileme tamamlandı.")
         except Exception as e:
-            self.log.log("ERROR", "TASK_MORNING_ERROR", f"Sabah yenileme hatası: {e}")
+            self.log.log("ERROR", "TASK_MORNING_ERR", f"Sabah yenileme hatası: {e}")
 
-    def _task_process_signals(self):
+    # ─────────────────────────────────────────
+    # 17:30 — Sinyal toplama penceresini aç
+    # ─────────────────────────────────────────
+
+    def _task_open_signal_window(self):
         """
-        17:30 görevi: Queue'daki sinyalleri okur ve filtreleyerek saklar.
+        webhook_server'ın SignalCollector'ını COLLECTING moduna alır.
+        17:35'te collector otomatik kapanır ve decide_trade_list() çağrılır.
+
+        Logda göreceğin satır:
+          [INFO] WINDOW_OPEN  [17:30] Sinyal toplama penceresi AÇILDI.
         """
-        self.log.log("INFO", "TASK_SIGNAL_PROCESS", "Sinyal işleme başlıyor.")
-        self._pending_signals = []
+        self.log.log("INFO", "TASK_WINDOW",
+                     "[17:30] Sinyal toplama penceresi açılıyor. "
+                     "TradingView alert'leri /webhook/signalA ve /webhook/signalB'ye gönderilmeli.")
+        self.webhook_server.open_collection_window()
 
-        # Queue'daki en son sinyali al
-        latest_signal = None
-        while not self.signal_queue.empty():
-            try:
-                latest_signal = self.signal_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        if not latest_signal:
-            self.log.log("WARNING", "TASK_NO_SIGNAL",
-                         "17:30'da işlenecek sinyal bulunamadı.")
-            return
-
-        incoming_symbols = latest_signal.get("symbols", [])
-        self.log.log("INFO", "TASK_SIGNAL_PROCESS",
-                     f"Gelen semboller: {incoming_symbols}")
-
-        # Portföy boşluğuna göre filtrele
-        selected = self.pm.filter_new_signals(incoming_symbols)
-        self._pending_signals = selected
-
-        self.log.log("INFO", "TASK_SIGNAL_PROCESS",
-                     f"17:40'ta alınacak semboller: {self._pending_signals}")
+    # ─────────────────────────────────────────
+    # 17:40 — Mark-to-Market + Alım emirleri
+    # ─────────────────────────────────────────
 
     def _task_send_buy_orders(self):
         """
-        17:40 görevi: Filtrelenmiş semboller için alım emirlerini gönderir.
+        Adım 1 — ListPositions (ApiCommands:1):
+          Açık pozisyonların LastPx değerleri çekilir.
+          → self._current_prices güncellenir
+          → webhook_server._live_prices güncellenir (Dashboard MTM)
+          → /api/trades ve /api/equity anlık fiyatları yansıtır
+
+        Adım 2 — Alım emirleri:
+          Queue'dan sinyal okunur (decide_trade_list sonucu).
+          Portföy filtresi uygulanır.
+          Bütçe: nakit / bugün_satılan_sayısı (0 ise MAX_POSITIONS fallback)
+          ApiCommands:3 emirleri gönderilir.
         """
-        if not self._pending_signals:
-            self.log.log("INFO", "TASK_BUY_SKIP", "Gönderilecek sinyal yok.")
+        # ── Adım 1: MTM fiyatları güncelle ────────────────────────────────
+        self.log.log("INFO", "TASK_MTM",
+                     "[17:40] ListPositions ile MTM fiyatları güncelleniyor.")
+        self.client.request_positions()
+        time.sleep(2)   # on_positions_response callback'ini bekle
+        self.log.log("INFO", "TASK_MTM",
+                     f"MTM fiyatları: {self._current_prices}")
+
+        # ── Adım 2: Queue'dan sinyal al ────────────────────────────────────
+        latest = None
+        while not self.signal_queue.empty():
+            try:
+                latest = self.signal_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if not latest:
+            self.log.log(
+                "WARNING", "TASK_BUY_NO_SIGNAL",
+                "[17:40] Queue boş. Olası sebepler: "
+                "(1) 17:30–17:35 arasında hiç sinyal gelmedi (Durum 3), "
+                "(2) İki listede ortak hisse yok, "
+                "(3) Filtreden geçen hisse yok.",
+            )
             return
 
-        self.log.log("INFO", "TASK_BUY_START",
-                     f"Alım emirleri gönderiliyor: {self._pending_signals}")
+        trade_list    = latest.get("symbols", [])
+        decision_code = latest.get("decision_code", "?")
 
-        # Mevcut nakit bilgisini çek
+        self.log.log(
+            "INFO", "TASK_BUY_START",
+            f"[17:40] Karar: {decision_code.upper()} | Alınacak: {trade_list}",
+            extra_data={"decision": decision_code, "trade_list": trade_list},
+        )
+
+        # Portföy filtresi
+        selected = self.pm.filter_new_signals(trade_list)
+        if not selected:
+            self.log.log("INFO", "TASK_BUY_SKIP",
+                         "Portföy filtresi sonrası alınacak hisse kalmadı.")
+            return
+
+        # Nakit
         available_cash = self._get_available_cash()
-
         if available_cash <= 0:
             self.log.log("ERROR", "TASK_BUY_NO_CASH",
                          f"Yetersiz nakit: {available_cash:.2f} TL")
             return
 
-        # O gün kaç hisse satıldığını bul → dilim hesabının temeli
-        today_sold_count = self._today_sold_count()
+        # Bütçe dilimi
+        today_sold    = self._today_sold_count()
+        budget_per_st = self.pm.calculate_budget_per_stock(available_cash, today_sold)
 
-        self.log.log(
-            "INFO", "TASK_BUY_SOLD_COUNT",
-            f"Bugun satilan hisse sayisi: {today_sold_count} "
-            f"({'fallback: MAX_POSITIONS kullanilacak' if today_sold_count == 0 else 'bu sayi bolunen olacak'})",
-            extra_data={"today_sold": today_sold_count,
-                        "pending":    self._pending_signals}
-        )
-
-        budget_per_stock = self.pm.calculate_budget_per_stock(available_cash, today_sold_count)
-
-        bought_symbols = []
-        for symbol in self._pending_signals:
+        # Emirleri gönder
+        bought = []
+        for symbol in selected:
             try:
-                # Güncel fiyatı al (önceki cache veya API'den)
-                current_price = self._current_prices.get(symbol)
-                if not current_price or current_price <= 0:
+                price = self._current_prices.get(symbol)
+                if not price or price <= 0:
                     self.log.log("WARNING", "TASK_BUY_NO_PRICE",
-                                 f"{symbol} için fiyat bilgisi yok, atlanıyor.",
-                                 symbol=symbol)
+                                 f"{symbol} için fiyat yok, atlanıyor.", symbol=symbol)
                     continue
 
-                quantity = self.pm.calculate_quantity(budget_per_stock, current_price)
-                if quantity <= 0:
-                    self.log.log("WARNING", "TASK_BUY_QTY_ZERO",
-                                 f"{symbol} için lot hesaplanamadı.", symbol=symbol)
+                qty = self.pm.calculate_quantity(budget_per_st, price)
+                if qty <= 0:
                     continue
 
-                # Alım emri gönder
-                success = self.client.send_new_order(
-                    symbol=symbol,
-                    price=current_price,
-                    quantity=quantity,
+                ok = self.client.send_new_order(
+                    symbol=symbol, price=price, quantity=qty,
                     order_side=config.ORDER_SIDE_BUY,
                     order_type=config.ORDER_TYPE,
                     time_in_force=config.TIME_IN_FORCE,
-                    transaction_type=config.TRANSACTION_TYPE
+                    transaction_type=config.TRANSACTION_TYPE,
                 )
 
-                if success:
-                    # DB'ye pozisyon aç (gerçek emir karşılanınca da güncellenebilir)
-                    position = self.pm.open_position(
-                        symbol=symbol,
-                        price=current_price,
-                        quantity=quantity,
-                        budget=budget_per_stock
-                    )
-
-                    if position:
-                        # TP/SL emirlerini hemen gönder
-                        import time; time.sleep(1)
-                        self.pm.send_tp_sl_orders(position)
-                        bought_symbols.append(symbol)
+                if ok:
+                    pos = self.pm.open_position(symbol=symbol, price=price,
+                                                quantity=qty, budget=budget_per_st)
+                    if pos:
+                        time.sleep(1)
+                        self.pm.send_tp_sl_orders(pos)
+                        bought.append(symbol)
+                        self.log.log(
+                            "INFO", "TASK_BUY_OK",
+                            f"{symbol} alındı: {qty} lot @ {price:.2f} TL "
+                            f"(Bütçe: {budget_per_st:,.2f} TL)",
+                            symbol=symbol,
+                        )
 
             except Exception as e:
-                self.log.log("ERROR", "TASK_BUY_ERROR",
-                             f"{symbol} alım emri hatası: {e}", symbol=symbol)
+                self.log.log("ERROR", "TASK_BUY_ERR",
+                             f"{symbol} alım hatası: {e}", symbol=symbol)
 
-        # Webhook sunucusuna bildirimleri kaydet
         if self.webhook_server:
-            self.webhook_server.mark_signal_processed(bought_symbols)
+            self.webhook_server.mark_signal_processed(bought)
 
-        self._pending_signals = []
         self.log.log("INFO", "TASK_BUY_DONE",
-                     f"Alım emirleri tamamlandı: {bought_symbols}")
+                     f"[17:40] Tamamlandı. Alınan: {bought}",
+                     extra_data={"bought": bought,
+                                 "skipped": [s for s in selected if s not in bought]})
+
+    # ─────────────────────────────────────────
+    # 17:55 — Gün sonu kapanış
+    # ─────────────────────────────────────────
 
     def _task_end_of_day_close(self):
-        """
-        17:55 görevi: 2 işlem günü sınırını aşmış pozisyonları kapatır.
-        """
-        self.log.log("INFO", "TASK_EOD_START", "Gün sonu kapanış kontrolü başlıyor.")
+        self.log.log("INFO", "TASK_EOD", "Gün sonu kapanış kontrolü.")
         try:
             expired = self.pm.get_expired_positions()
             if not expired:
-                self.log.log("INFO", "TASK_EOD_NO_EXPIRED", "Süresi dolan pozisyon yok.")
+                self.log.log("INFO", "TASK_EOD", "Süresi dolan pozisyon yok.")
                 return
-
             self.pm.close_expired_positions_eod(self._current_prices)
-            self.log.log("INFO", "TASK_EOD_DONE",
+            self.log.log("INFO", "TASK_EOD",
                          f"{len(expired)} pozisyon gün sonu kapatıldı.")
         except Exception as e:
-            self.log.log("ERROR", "TASK_EOD_ERROR", f"Gün sonu kapanış hatası: {e}")
+            self.log.log("ERROR", "TASK_EOD_ERR", f"Gün sonu hatası: {e}")
+
+    # ─────────────────────────────────────────
+    # 18:05 — İşlem günü sayacı
+    # ─────────────────────────────────────────
 
     def _task_increment_trading_days(self):
-        """18:05 görevi: İşlem günü sayacını artırır."""
         try:
             self.pm.increment_trading_days()
         except Exception as e:
-            self.log.log("ERROR", "TASK_DAY_INC_ERROR", f"Gün artırma hatası: {e}")
+            self.log.log("ERROR", "TASK_DAY_ERR", f"Gün sayacı hatası: {e}")
 
     # ─────────────────────────────────────────
-    # API CALLBACK KURULUMU
+    # API CALLBACK'LERİ
     # ─────────────────────────────────────────
 
     def _setup_api_callbacks(self):
-        """MatriksIQ API callback'lerini kaydeder."""
 
-        # Emirler sorgusu yanıtı (ApiCommands: 2)
-        def on_orders_response(data: dict):
-            orders = data.get("OrderApiModels", [])
-            self._open_orders_cache = orders
-            self.log.log("INFO", "API_ORDERS_RECEIVED",
-                         f"{len(orders)} bekleyen emir alındı.")
+        # ApiCommands:2 — Bekleyen emirler
+        def on_orders(data):
+            self._open_orders_cache = data.get("OrderApiModels", [])
+            self.log.log("INFO", "CB_ORDERS",
+                         f"{len(self._open_orders_cache)} bekleyen emir.")
+        self.client.register_callback(2, on_orders)
 
-        # ── HESAP BİLGİLERİ YANITI (ApiCommands: 8) ──────────────────────────
-        # Döküman Sayfa 25 — Hesap Bilgileri Sorgusu çıktısı:
+        # ApiCommands:1 — ListPositions (mark-to-market)
+        #
+        # Döküman: ListPositions yanıtı
         # {
-        #   "Informations": [
-        #     { "Code": "BAL", "Key": "Bakiye",       "Value": "9574528.62", "DataType": 2 },
-        #     { "Code": "ISL", "Key": "Islem limiti", "Value": "9574528.62", "DataType": 2 },
-        #     { "Code": "OAL", "Key": "Overall",      "Value": "10620184",   "DataType": 2 },
-        #     ...
-        #   ],
-        #   "ApiCommands": 8
+        #   "ApiCommands": 1,
+        #   "Positions": [
+        #     {"Symbol":"GARAN","LastPx":63.10,"AvgCost":62.20,"Qty":100,...}
+        #   ]
         # }
-        # "Code": "BAL" → kullanılabilir nakit bakiyesini verir.
-        def on_account_info(data: dict):
-            informations = data.get("Informations", [])
-            if not informations:
-                self.log.log("WARNING", "API_ACCT_EMPTY",
-                             "Hesap bilgileri boş döndü.")
+        def on_positions(data):
+            positions = data.get("Positions", [])
+            if not positions:
+                self.log.log("WARNING", "CB_POSITIONS_EMPTY",
+                             "ListPositions boş döndü.")
                 return
+            updated = {}
+            for pos in positions:
+                sym = pos.get("Symbol", "")
+                px  = pos.get("LastPx",  0.0)
+                if sym and px:
+                    self._current_prices[sym] = px          # Emir fiyat cache
+                    self.webhook_server.update_live_price(sym, px)  # Dashboard MTM
+                    updated[sym] = px
+            self.log.log(
+                "INFO", "CB_POSITIONS_MTM",
+                f"MTM güncellendi: {updated}",
+                extra_data={"prices": updated},
+            )
+        self.client.register_callback(1, on_positions)
 
-            parsed_cash = self._parse_balance_from_info(informations)
-            if parsed_cash is not None:
-                self._cached_cash = parsed_cash
-                self.log.log(
-                    "INFO", "API_CASH_UPDATED",
-                    f"Kullanılabilir nakit güncellendi: {parsed_cash:,.2f} TL",
-                    extra_data={"balance": parsed_cash}
-                )
+        # ApiCommands:8 — Hesap bakiyesi
+        def on_account(data):
+            info = data.get("Informations", [])
+            cash = self._parse_balance(info)
+            if cash is not None:
+                self._cached_cash = cash
+                self.log.log("INFO", "CB_CASH",
+                             f"Nakit güncellendi: {cash:,.2f} TL")
             else:
-                self.log.log("WARNING", "API_BAL_NOT_FOUND",
-                             "Hesap bilgilerinde 'BAL' kodu bulunamadı. "
-                             "Mevcut nakit değeri korunuyor.")
+                self.log.log("WARNING", "CB_CASH_MISS", "BAL kodu bulunamadı.")
+        self.client.register_callback(8, on_account)
 
-        # Emir/Pozisyon durum değişiklikleri — broadcast (sorgu yapılmadan gelen)
-        def on_broadcast(data: dict):
-            api_cmd = data.get("ApiCommands")
-            if api_cmd == 3:    # Emir durum değişikliği
+        # Broadcast — Anlık emir/pozisyon değişiklikleri
+        def on_broadcast(data):
+            cmd = data.get("ApiCommands")
+            if cmd == 3:
                 self.pm.handle_order_status_change(data)
-            elif api_cmd == 4:  # Pozisyon durum değişikliği
-                symbol = data.get("Symbol", "")
-                last_px = data.get("LastPx", 0.0)
-                if symbol and last_px:
-                    self._current_prices[symbol] = last_px
-
-        self.client.register_callback(2, on_orders_response)
-        self.client.register_callback(8, on_account_info)   # Hesap bilgileri
+            elif cmd == 4:
+                sym = data.get("Symbol", "")
+                px  = data.get("LastPx", 0.0)
+                if sym and px:
+                    self._current_prices[sym] = px
+                    self.webhook_server.update_live_price(sym, px)
         self.client.set_broadcast_callback(on_broadcast)
 
     # ─────────────────────────────────────────
-    # BAKİYE PARSE YARDIMCISI
+    # YARDIMCILAR
     # ─────────────────────────────────────────
 
     @staticmethod
-    def _parse_balance_from_info(informations: list) -> float | None:
-        """
-        Döküman Sayfa 25 — Hesap bilgileri yanıtındaki Informations listesini tarar.
-
-        Öncelik sırası:
-          1. Code == "BAL"  → Kullanılabilir nakit bakiye (birincil kaynak)
-          2. Code == "ISL"  → İşlem limiti (BAL yoksa fallback)
-
-        DataType == 2 olan alanlar sayısal değer içerir (string olarak gelir).
-
-        Returns:
-            float — bulunan bakiye değeri
-            None  — hiçbir eşleşme bulunamazsa
-        """
-        priority_codes = ["BAL", "ISL"]   # ISL = işlem limiti, BAL yoksa kullan
-
-        # Önce tam kod eşleşmesi ara
-        for code in priority_codes:
+    def _parse_balance(informations: list) -> float | None:
+        for code in ["BAL", "ISL"]:
             for item in informations:
                 if item.get("Code", "").upper() == code:
-                    raw_value = item.get("Value", "")
                     try:
-                        # Gelen değer string: "9574528.62"
-                        # Türkçe format varsa (nokta=binlik, virgül=ondalık) normalize et
-                        cleaned = raw_value.replace(",", ".")
-                        # Eğer birden fazla nokta varsa binlik ayracı temizle
-                        parts = cleaned.split(".")
+                        raw     = item.get("Value", "")
+                        cleaned = raw.replace(",", ".")
+                        parts   = cleaned.split(".")
                         if len(parts) > 2:
-                            # "9.574.528.62" → "9574528.62"
                             cleaned = "".join(parts[:-1]) + "." + parts[-1]
                         return float(cleaned)
                     except (ValueError, AttributeError):
-                        continue  # Parse edilemedi, bir sonraki kodu dene
-
+                        continue
         return None
 
-    # ─────────────────────────────────────────
-    # YARDIMCI METODLAR
-    # ─────────────────────────────────────────
+    def _get_available_cash(self) -> float:
+        self.client.request_account_info()
+        time.sleep(2)
+        cash = self._cached_cash
+        if cash <= 0:
+            self.log.log("ERROR", "CASH_ZERO",
+                         "Nakit sıfır — MatriksIQ'da hesap giriş yapılmış mı?")
+        else:
+            self.log.log("INFO", "CASH_OK", f"Kullanılabilir nakit: {cash:,.2f} TL")
+        return cash
 
     def _today_sold_count(self) -> int:
-        """
-        Bugün kapatılan (satılan) pozisyon sayısını veritabanından okur.
-
-        Bu sayı dilim hesabının böleni olur:
-          dilim = toplam_nakit / today_sold_count
-
-        Eğer bugün hiç satış yoksa (bot yeni başlatıldı, portföy boştu)
-        0 döner → calculate_budget_per_stock MAX_POSITIONS fallback'e geçer.
-        """
-        from database import Trade
-        from datetime import date
-        import sqlalchemy
-
         session = self.pm.Session()
         try:
             today_start = datetime.combine(date.today(), datetime.min.time())
-            count = (
+            return int(
                 session.query(Trade)
-                .filter(
-                    Trade.is_closed == True,
-                    Trade.sell_date >= today_start,
-                )
+                .filter(Trade.is_closed == True, Trade.sell_date >= today_start)
                 .count()
             )
-            return int(count)
         except Exception as e:
-            self.log.log("WARNING", "SOLD_COUNT_ERROR",
-                         f"Bugun satilan hisse sayisi alinamadi: {e}. "
-                         f"Fallback: MAX_POSITIONS kullanilacak.")
+            self.log.log("WARNING", "SOLD_COUNT_ERR",
+                         f"Satış sayısı alınamadı: {e}. MAX_POSITIONS fallback.")
             return 0
         finally:
             session.close()
 
-    def _get_available_cash(self) -> float:
-        """
-        Kullanılabilir nakiti döndürür.
-
-        Döküman Sayfa 25 — Hesap Bilgileri Sorgusu (ApiCommands: 7) tetiklenir.
-        Yanıt on_account_info callback'ine düşer ve _cached_cash güncellenir.
-        Callback tamamlanana kadar kısa bir bekleme uygulanır.
-
-        Fallback: API'den değer gelmezse son önbellek değeri kullanılır.
-        İlk başlatmada önbellek sıfır ise uyarı verilir.
-        """
-        import time
-
-        # Güncel bakiyeyi çek
-        self.client.request_account_info()
-        time.sleep(2)   # API yanıtını bekle (callback _cached_cash'i doldurur)
-
-        cash = getattr(self, "_cached_cash", 0.0)
-
-        if cash <= 0:
-            self.log.log(
-                "ERROR", "API_NO_CASH",
-                "Kullanılabilir nakit sıfır veya alınamadı. "
-                "Alım emirleri gönderilemeyecek. "
-                "MatriksIQ'da hesabın giriş yapılmış olduğunu kontrol edin."
-            )
-        else:
-            self.log.log(
-                "INFO", "API_CASH_READ",
-                f"Kullanılabilir nakit: {cash:,.2f} TL"
-            )
-
-        return cash
-
     def update_price(self, symbol: str, price: float):
-        """Harici kaynaktan fiyat günceller."""
         self._current_prices[symbol] = price
 
     def manual_trigger(self, task_name: str):
-        """Belirtilen görevi manuel olarak tetikler (test için)."""
         tasks = {
-            "morning_refresh": self._task_morning_refresh,
-            "process_signals": self._task_process_signals,
-            "send_buy_orders": self._task_send_buy_orders,
-            "eod_close": self._task_end_of_day_close,
+            "morning":    self._task_morning_refresh,
+            "open_window":self._task_open_signal_window,
+            "buy_orders": self._task_send_buy_orders,
+            "eod":        self._task_end_of_day_close,
         }
         if task_name in tasks:
-            self.log.log("INFO", "MANUAL_TRIGGER", f"Manuel tetikleme: {task_name}")
+            self.log.log("INFO", "MANUAL", f"Manuel tetikleme: {task_name}")
             tasks[task_name]()
         else:
-            self.log.log("WARNING", "MANUAL_TRIGGER",
-                         f"Bilinmeyen görev: {task_name}. "
-                         f"Geçerli görevler: {list(tasks.keys())}")
+            self.log.log("WARNING", "MANUAL", f"Bilinmeyen görev: {task_name}")
