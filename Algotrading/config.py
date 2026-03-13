@@ -35,7 +35,18 @@ MAX_HOLD_DAYS = 2          # Maksimum elde tutma günü (işlem günü)
 SIGNAL_CHECK_TIME = "17:30"       # TradingView sinyali bekleme saati
 ORDER_SEND_TIME = "17:40"         # Alım emirlerinin gönderilme saati
 EOD_CLOSE_TIME = "17:55"          # Gün sonu zorla kapanış saati (17:55 güvenli)
-MORNING_REFRESH_TIME = "08:05"    # Sabah TP/SL yenileme saati
+# ─────────────────────────────────────────────
+# ZAMANLAMA — buradan değiştir, botu yeniden başlat
+# ─────────────────────────────────────────────
+MORNING_REFRESH_TIME  = "10:05"   # Sabah TP/SL yenileme
+SIGNAL_WINDOW_START   = "17:30"   # Sinyal toplama penceresi AÇILIŞ (TradingView alertleri bu saatten sonra kabul edilir)
+SIGNAL_WINDOW_END     = "17:35"   # Sinyal toplama penceresi KAPANIŞ (karar bu saatte verilir)
+ORDER_SEND_TIME       = "17:40"   # Alım emirleri Matriks'e iletilir
+EOD_CLOSE_TIME        = "17:55"   # 2-günü dolan pozisyonlar zorla kapatılır
+DAY_INCREMENT_TIME    = "18:05"   # İşlem günü sayacı artırılır
+
+# Geriye dönük uyumluluk
+SIGNAL_CHECK_TIME = SIGNAL_WINDOW_START
 
 # ─────────────────────────────────────────────
 # VERİTABANI AYARLARI

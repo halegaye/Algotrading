@@ -48,13 +48,36 @@ class TaskScheduler:
     # BAŞLAT / DURDUR
     # ─────────────────────────────────────────
 
+    @staticmethod
+    def _hm(t: str) -> tuple:
+        """'HH:MM' stringini (hour, minute) tuple'ına çevirir."""
+        h, m = t.strip().split(":")
+        return int(h), int(m)
+
     def start(self):
+        """
+        Tüm görev saatleri config.py'den okunur.
+        Değiştirmek için config.py'yi düzenle, botu yeniden başlat.
+
+        config.py'deki ilgili satırlar:
+          MORNING_REFRESH_TIME  = "10:05"
+          SIGNAL_WINDOW_START   = "17:30"
+          ORDER_SEND_TIME       = "17:40"
+          EOD_CLOSE_TIME        = "17:55"
+          DAY_INCREMENT_TIME    = "18:05"
+        """
+        t_morning = self._hm(getattr(config, "MORNING_REFRESH_TIME", "10:05"))
+        t_window  = self._hm(getattr(config, "SIGNAL_WINDOW_START",  "17:30"))
+        t_orders  = self._hm(getattr(config, "ORDER_SEND_TIME",      "17:40"))
+        t_eod     = self._hm(getattr(config, "EOD_CLOSE_TIME",       "17:55"))
+        t_dayinc  = self._hm(getattr(config, "DAY_INCREMENT_TIME",   "18:05"))
+
         jobs = [
-            ("morning_refresh",  10, 5,  self._task_morning_refresh,  "Sabah TP/SL"),
-            ("open_window",      17, 30, self._task_open_signal_window,"Pencere Aç"),
-            ("send_buy_orders",  17, 40, self._task_send_buy_orders,   "Alım Emirleri"),
-            ("eod_close",        17, 55, self._task_end_of_day_close,  "Gün Sonu"),
-            ("increment_days",   18, 5,  self._task_increment_trading_days, "Gün Sayacı"),
+            ("morning_refresh", t_morning[0], t_morning[1], self._task_morning_refresh,       "Sabah TP/SL"),
+            ("open_window",     t_window[0],  t_window[1],  self._task_open_signal_window,    "Pencere Aç"),
+            ("send_buy_orders", t_orders[0],  t_orders[1],  self._task_send_buy_orders,       "Alım Emirleri"),
+            ("eod_close",       t_eod[0],     t_eod[1],     self._task_end_of_day_close,      "Gün Sonu"),
+            ("increment_days",  t_dayinc[0],  t_dayinc[1],  self._task_increment_trading_days,"Gün Sayacı"),
         ]
         for jid, hr, mn, fn, name in jobs:
             self._scheduler.add_job(
@@ -63,9 +86,16 @@ class TaskScheduler:
                 id=jid, name=name, replace_existing=True,
             )
         self._scheduler.start()
+
+        wstart = getattr(config, "SIGNAL_WINDOW_START", "17:30")
+        wend   = getattr(config, "SIGNAL_WINDOW_END",   "17:35")
         self.log.log("INFO", "SCHEDULER_START",
-                     "Zamanlayıcı başlatıldı → "
-                     "10:05 TP/SL | 17:30 Pencere | 17:40 Emirler | 17:55 EOD | 18:05 Gün++")
+                     f"Zamanlayıcı başlatıldı → "
+                     f"{getattr(config, 'MORNING_REFRESH_TIME', '10:05')} TP/SL | "
+                     f"{wstart} Pencere Aç | "
+                     f"{wend} Pencere Kapat | "
+                     f"{getattr(config, 'ORDER_SEND_TIME', '17:40')} Emirler | "
+                     f"{getattr(config, 'EOD_CLOSE_TIME', '17:55')} EOD")
 
     def stop(self):
         self._scheduler.shutdown(wait=False)
